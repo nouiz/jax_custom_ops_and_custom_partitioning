@@ -75,8 +75,13 @@ def partition_ln_fwd(zero_centered_gamma, epsilon, arg_infos, result_infos):
     # The list and tuple bellow are important. If you change those type, you will get errors.
     return _impl, [a.sharding for a in result_infos], arg_shard
 
+def is_dimensions_sharded(sharding, dim):
+    if len(sharding.spec) <= dim:
+        return False
+    return sharding.spec[dim]
+
 def infer_sharding_from_operands_ln_fwd(zero_centered_gamma, epsilon, arg_infos, out_shape):
-    rsigma_sharding = NamedSharding(mesh, PartitionSpec(arg_infos[0].sharding.spec[0]))
+    rsigma_sharding = NamedSharding(mesh, PartitionSpec(is_dimensions_sharded(arg_infos[0].sharding, 0)))
     # Must return a list, not a tuple.
     return [force_not_sharded_dim(arg_infos[0].sharding, 1), rsigma_sharding, rsigma_sharding]
 
@@ -135,7 +140,12 @@ y2_ = random.normal(random.PRNGKey(1127), (128, 128))
 graded_f = jax.value_and_grad(func, argnums=(0, 1, 2, 3, 4))
 ref_l, ref_grads = graded_f(x_, gamma_, beta_, y1_, y2_)
 
-devices = np.array(jax.local_devices()).reshape((4, 2))
+devices = np.array(jax.local_devices())
+if len(devices) == 2:
+    devices = devices.reshape((2, 1))
+else:
+    devices = devices.reshape((4, 2))
+
 with Mesh(devices, ('x', 'y')) as mesh:
     x = jax.device_put(x_, NamedSharding(mesh, PartitionSpec('x', None)))
     gamma = jax.device_put(gamma_, NamedSharding(mesh, PartitionSpec(None)))
