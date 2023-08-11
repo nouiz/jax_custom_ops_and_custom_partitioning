@@ -228,14 +228,14 @@ def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
 
 def func(x, gamma, beta, y1, y2):
     if TEST_CASE == 0:
-        x, _, _ = _layernorm(x, gamma, beta, None, False, 1e-6)
+        x = _layernorm(x, gamma, beta, None, False, 1e-6)
         x = jnp.dot(x, y1)
         out = jnp.dot(x, y2)
         return jnp.mean(out)
     else:
         x = jnp.dot(x, y1)
         x = jnp.dot(x, y2)
-        out, _, _ = _layernorm(x, gamma, beta, None, False, 1e-6)
+        out = _layernorm(x, gamma, beta, None, False, 1e-6)
         return jnp.mean(out)
 
 
