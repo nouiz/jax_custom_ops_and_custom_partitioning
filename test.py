@@ -11,112 +11,221 @@ from jax.sharding import Mesh
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec, NamedSharding
+P = PartitionSpec
 
-from transformer_engine.jax.cpp_extensions import layernorm_fwd, layernorm_bwd
+from transformer_engine.jax import cpp_extensions
 
 # 0: ln-dot-dot, 1: dot-dot-ln
 TEST_CASE = int(os.environ.get("TEST_CASE", 0))
 assert TEST_CASE in (0, 1)
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
+
+# First, we'll set up the user-facing layernorm function. It's backed by the
+# layernorm_fwd_p primitive, which is different from (and sits on top of) the
+# primitive in transformer_engine for reasons we'll see below. We use custom_vjp
+# to set up the analogous layernorm_bwd_p primitive as its backward pass rule.
+
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+def layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
+  z, *_ = layernorm_fwd_p.bind(x, gamma, beta,
+                               zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+  return z
+
+def layernorm_fwd_rule(x, gamma, beta, zero_centered_gamma, epsilon):
+  z, mu, rsigma = layernorm_fwd_p.bind(
+      x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+  return z, (x, mu, rsigma, gamma)
+
+def layernorm_bwd_rule(zero_centered_gamma, epsilon, res, dz):
+  x, mu, rsigma, gamma = res
+  dx, dgamma, dbeta = layernorm_bwd_p.bind(
+      dz, x, mu, rsigma, gamma,
+      zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+  return dx, dgamma, dbeta
+
+layernorm.defvjp(layernorm_fwd_rule, layernorm_bwd_rule)
+
+
+# Next, we'll define the two primitives, starting with layernorm_fwd_p. We'll
+# set up vmap and lowering rules. The lowering rule will have the custom
+# partitioning information, and will itself call into the CustomCall-backed
+# primitive defined in transformer_engine.
+#
+# To be closed under vmapping, we'll define layernorm_fwd_p to handle
+# arbitrarily many batch dimensions rather than just one.
+
+
+layernorm_fwd_p = core.Primitive('layernorm_fwd')
+layernorm_fwd_p.multiple_results = True
+
+@layernorm_fwd_p.def_abstract_eval
+def _layernorm_fwd_abstract_eval(x_aval, gamma_aval, beta_aval, *,
+                                 zero_centered_gamma, epsilon):
+  # x_aval: [N1, N2, ..., Nk, H]  # NOTE: multiple leading batch axes!
+  # gamma_aval: [H]
+  # beta_aval: [H]
+  # epsilon_aval: []
+  del gamma_aval, beta_aval, epsilon
+  out_aval = core.raise_to_shaped(x_aval)
+  mu_aval = rsigma_aval = out_aval.update(shape=out_aval.shape[:-1])
+  return out_aval, mu_aval, rsigma_aval
+
+# While the layernorm_fwd_p in this file supports multiple batch dimensions, the
+# primitive in transformer_engine (and the GPU kernel we ultimately CustomCall
+# into) handles just one. So we'll need to do some reshapes to flatten batch
+# dimensions. It's important to do the reshapes here, "inside" layernorm_fwd_p
+# rather than outside it, so that the SPMD partitioner doesn't need to handle
+# the reshapes (as they'll be inside our custom_partitioning rule for
+# layernorm_fwd_p).
+
+@layernorm_fwd_p.def_impl
+def layernorm_fwd_impl(x, gamma, beta, zero_centered_gamma, epsilon):
+  pre = x.shape[:-1]
+  x = x.reshape(-1, x.shape[-1])
+  normed, mu, rsigma = cpp_extensions.layernorm_fwd(
+      x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+  return normed.reshape(*pre, -1), mu.reshape(pre), rsigma.reshape(pre)
+
+
+# The vmap (batching) rule for layernorm_fwd_p just needs to put batch
+# dimensions at the front.
+
+from jax._src.interpreters import batching
+
+def layernorm_fwd_batcher(
+    batched_args: Sequence[jax.Array],
+    batch_dims: int | None,
+    *,
+    zero_centered_gamma: bool,
+    epsilon: float,
+) -> tuple[Sequence[jax.Array], Sequence[int | None]]:
+  x, gamma, beta = batched_args
+  x_bdim, gamma_bdim, beta_bdim = batch_dims
+  if not (gamma_bdim is beta_bdim is batching.not_mapped):
+    raise NotImplementedError
+  if x_bdim == x.ndim - 1:
+    x = jnp.moveaxis(x, -1, -2)
+    x_bdim = x.ndim - 2
+  out_bdims = x_bdim, batching.not_mapped, batching.not_mapped
+  return layernorm_fwd_p.bind(x, gamma, beta, epsilon=epsilon), out_bdims
+batching.primitive_batchers[layernorm_fwd_p] = layernorm_fwd_batcher
+
+
+# The lowering rule for layernorm_fwd_p will be based on applying mlir.lower_fun
+# to a custom_partitioning-decorated helper function.
+# TODO(parkers,mattjj): This layering is a bit tricky, make it more convenient?
+
+from jax._src.interpreters import mlir
+from jax.experimental.custom_partitioning import custom_partitioning
+
+_layernorm_fwd_lower = custom_partitioning(layernorm_fwd_impl,
+                                           static_argnums=(3, 4))
+
+# NOTE: `mesh` argument was added in the recent JAX commit 74bcd65
+def infer_sharding_from_operands(epsilon, mesh, arg_infos, result_infos):
+  del epsilon, result_infos  # Unused.
+  x_spec = get_padded_spec(arg_infos[0])
+  out_sharding = NamedSharding(mesh, P(*x_spec[:-1]))
+  return (out_sharding,) * 3
+
+# NOTE: `mesh` argument and output was added in the recent JAX commit 74bcd65
+def partition(epsilon, mesh, arg_infos, result_infos):
+  x_spec = get_padded_spec(arg_infos[0])
+  arg_shardings = (NamedSharding(mesh, P(*x_spec[:-1], None)),
+                   ) + (NamedSharding(mesh, P()),) * 2
+  out_shardings = (NamedSharding(mesh, P(*x_spec[:-1])),) * 3
+  return mesh, partial(layernorm_fwd_impl, epsilon=epsilon), out_shardings, arg_shardings
+
+_layernorm_fwd_lower.def_partition(
+    infer_sharding_from_operands=infer_sharding_from_operands,
+    partition=partition)
+
+mlir.register_lowering(layernorm_fwd_p,
+                       mlir.lower_fun(_layernorm_fwd_lower, multiple_results=True))
+
+
+# Next, we set up the layernorm_bwd_p primitive. For an MVP, it needs fewer
+# rules: in particular, if we don't need vmap-of-grad or grad-of-grad, and
+# instead only need grad-of-vmap, then all it needs is a lowering rule.
+
+layernorm_bwd_p = core.Primitive('layernorm_bwd')
+layernorm_bwd_p.multiple_results = True
+
+@layernorm_bwd_p.def_abstract_eval
+def layernorm_bwd_abstract_eval(dz_aval, _, __, ___, gamma_aval, *,
+                                zero_centered_gamma, epsilon):
+  dx_aval = core.raise_to_shaped(dz_aval)
+  dgamma_aval = dbeta_aval = core.raise_to_shaped(gamma_aval)
+  return dx_aval, dgamma_aval, dbeta_aval
+
+@layernorm_bwd_p.def_impl
+def layernorm_bwd_impl(dz, x, mu, rsigma, gamma, zero_centered_gamma, epsilon):
+  pre = x.shape[:-1]
+  dz = dz.reshape(-1, x.shape[-1])
+  x = x.reshape(-1, x.shape[-1])
+  mu = mu.reshape(-1)
+  rsigma = rsigma.reshape(-1)
+  dx, dgamma, dbeta = cpp_extensions.layernorm_bwd(
+      dz, mu, rsigma, x, gamma, zero_centered_gamma=zero_centered_gamma,
+      epsilon=epsilon)
+  return dx.reshape(*pre, -1), dgamma, dbeta
+
+_layernorm_bwd_lower = custom_partitioning(layernorm_bwd_impl, static_argnums=(5, 6))
+def infer_sharding_from_operands(
+    zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
+  x_spec = get_padded_spec(arg_infos[0])
+  dx_sharding = NamedSharding(mesh, P(*x_spec[:-1], None))
+  dgamma_sharding = dbeta_sharding = NamedSharding(mesh, P())
+  return dx_sharding, dgamma_sharding, dbeta_sharding
+
+def partition(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
+  x_spec = get_padded_spec(arg_infos[1])
+  dx_sharding = NamedSharding(mesh, P(*x_spec[:-1], None))
+  dgamma_sharding = dbeta_sharding = NamedSharding(mesh, P())
+  out_shardings = dx_sharding, dgamma_sharding, dbeta_sharding
+  arg_shardings = (NamedSharding(mesh, P(*x_spec[:-1])),) * 4
+  arg_shardings = (*arg_shardings, NamedSharding(mesh, P()))
+
+  def sharded_impl(dz, x, mu, rsigma, gamma):
+    local_dx, local_dgamma, local_dbeta = \
+        layernorm_bwd_impl(
+            dz, x, mu, rsigma, gamma, zero_centered_gamma=zero_centered_gamma,
+            epsilon=epsilon)
+    global_dgamma = jax.lax.psum(local_dgamma, filter_none(x_spec[:-1]))
+    global_dbeta  = jax.lax.psum( local_dbeta, filter_none(x_spec[:-1]))
+    return local_dx, global_dgamma, global_dbeta
+
+  return mesh, sharded_impl, out_shardings, arg_shardings
+
+# NOTE: helper function no longer needed after the recent JAX commit 03575c4
+def get_padded_spec(arg_info: jax.ShapeDtypeStruct) -> tuple:
+  if arg_info.sharding is None:
+    return (None,) * arg_info.ndim
+  ndim, spec = arg_info.ndim, arg_info.sharding.spec
+  assert len(spec) <= ndim
+  return spec + (None,) * (ndim - len(spec))
+
+def filter_none(xs: tuple) -> tuple:
+  return tuple(x for x in xs if x is not None)
+
+_layernorm_bwd_lower.def_partition(
+    infer_sharding_from_operands=infer_sharding_from_operands,
+    partition=partition
+)
+
+
+mlir.register_lowering(layernorm_bwd_p,
+                       mlir.lower_fun(_layernorm_bwd_lower, multiple_results=True))
+
+
+# Tests
+
+# NOTE: wrapper which skips the layernorm_type argument; since it was unused
+# it's not clear if it's needed
 def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
-    outputs = _layernorm_fwd_custom_p(x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-    return outputs
-
-
-@partial(custom_partitioning, static_argnums=(3, 4))
-def _layernorm_fwd_custom_p(x, gamma, beta, zero_centered_gamma, epsilon):
-    outputs = layernorm_fwd(x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-    return outputs
-
-@partial(custom_partitioning, static_argnums=(5, 6))
-def _layernorm_bwd_custom_p(g, mu, rsigma, x, gamma, zero_centered_gamma, epsilon):
-    outputs = layernorm_bwd(g, mu, rsigma, x, gamma,
-                            zero_centered_gamma=zero_centered_gamma,
-                            epsilon=epsilon)
-    return outputs
-
-def _layernorm_fwd(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
-    outputs = _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon)
-    _, mu, rsigma = outputs
-    return outputs, (mu, rsigma, x, gamma)
-
-def _layernorm_bwd(layernorm_type, zero_centered_gamma, epsilon, ctx, g):
-    mu, rsigma, x, gamma = ctx
-
-    grad_input, grad_gamma, grad_beta = _layernorm_bwd_custom_p(g[0], mu, rsigma, x, gamma,
-                                                      zero_centered_gamma=zero_centered_gamma,
-                                                      epsilon=epsilon)
-    return grad_input, grad_gamma, grad_beta
-
-_layernorm.defvjp(_layernorm_fwd, _layernorm_bwd)
-
-
-def force_not_sharded_dim(shard, dim):
-    # Utility to force a dim to NOT be sharded
-    # TODO: For updated JAX, convert shard to a positional sharding to be sure to cover 100% cases.
-    assert isinstance(shard, NamedSharding)
-    if len(shard.spec) <= dim:
-        # Replicated as not specified.
-        return shard
-    if shard.spec[dim] is None:
-        # Specified as Sharded
-        return shard
-    return NamedSharding(shard.mesh, PartitionSpec(*shard.spec[:dim], None, *shard.spec[dim+1:]))
-
-def partition_ln_fwd(zero_centered_gamma, epsilon, arg_infos, result_infos):
-    def _impl(x, gamma, beta):
-        outputs = layernorm_fwd(x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-        return outputs
-
-    arg_shard = force_not_sharded_dim(arg_infos[0].sharding, 1), \
-                force_not_sharded_dim(arg_infos[1].sharding, 0), \
-                force_not_sharded_dim(arg_infos[2].sharding, 0)
-    # The list and tuple bellow are important. If you change those type, you will get errors.
-    return _impl, [a.sharding for a in result_infos], arg_shard
-
-def is_dimensions_sharded(sharding, dim):
-    if len(sharding.spec) <= dim:
-        return False
-    return sharding.spec[dim]
-
-def infer_sharding_from_operands_ln_fwd(zero_centered_gamma, epsilon, arg_infos, out_shape):
-    rsigma_sharding = NamedSharding(mesh, PartitionSpec(is_dimensions_sharded(arg_infos[0].sharding, 0)))
-    # Must return a list, not a tuple.
-    return [force_not_sharded_dim(arg_infos[0].sharding, 1), rsigma_sharding, rsigma_sharding]
-
-_layernorm_fwd_custom_p.def_partition(
-    infer_sharding_from_operands=infer_sharding_from_operands_ln_fwd,
-    partition=partition_ln_fwd)
-
-def partition_ln_bwd(zero_centered_gamma, epsilon, arg_infos, result_infos):
-    def _impl(g, mu, rsigma, x, gamma):
-        outputs = layernorm_bwd(g, mu, rsigma, x, gamma, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-        return outputs
-
-    arg_shard = (
-        arg_infos[0].sharding,
-        arg_infos[1].sharding,
-        arg_infos[2].sharding,
-        arg_infos[3].sharding,
-        arg_infos[4].sharding
-    )
-    # The list and tuple bellow are important. If you change those type, you will get errors.
-    return _impl, [a.sharding for a in result_infos], arg_shard
-
-def infer_sharding_from_operands_ln_bwd(zero_centered_gamma, epsilon, arg_infos, out_shape):
-    # TODO (Ming Huang): Backward cannot automatically trigger all-reduce along mesh's x-axis for dgamma and dbeta.
-    wgrads = NamedSharding(mesh, PartitionSpec(None))
-    # TODO (Ming Huang): Why grad_output have no sharding info? It should be sharded along x-axis in the mesh.
-    # It could be sharding=None, or Sharding=PartitionSpec(), but expect to get PartitionSpec('x')
-    assert arg_infos[0].sharding is not None
-    return [force_not_sharded_dim(arg_infos[0].sharding, 1), wgrads, wgrads]
-
-
-
-_layernorm_bwd_custom_p.def_partition(
-    infer_sharding_from_operands=infer_sharding_from_operands_ln_bwd,
-    partition=partition_ln_bwd)
+  assert layernorm_type is None
+  del layernorm_type
+  return layernorm(x, gamma, beta, zero_centered_gamma, epsilon)
 
 def func(x, gamma, beta, y1, y2):
     if TEST_CASE == 0:
