@@ -64,7 +64,6 @@ def _layernorm_fwd_abstract_eval(x_aval, gamma_aval, beta_aval, *,
   # x_aval: [N1, N2, ..., Nk, H]  # NOTE: multiple leading batch axes!
   # gamma_aval: [H]
   # beta_aval: [H]
-  # epsilon_aval: []
   del gamma_aval, beta_aval, epsilon
   out_aval = core.raise_to_shaped(x_aval)
   mu_aval = rsigma_aval = out_aval.update(shape=out_aval.shape[:-1])
@@ -94,7 +93,7 @@ from jax._src.interpreters import batching
 
 def layernorm_fwd_batcher(
     batched_args: Sequence[jax.Array],
-    batch_dims: int | None,
+    batch_dims: Sequence[int | None],
     *,
     zero_centered_gamma: bool,
     epsilon: float,
