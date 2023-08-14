@@ -121,19 +121,21 @@ _layernorm_fwd_lower = custom_partitioning(layernorm_fwd_impl,
                                            static_argnums=(3, 4))
 
 # NOTE: `mesh` argument was added in the recent JAX commit 74bcd65
-def infer_sharding_from_operands(epsilon, mesh, arg_infos, result_infos):
+def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   del epsilon, result_infos  # Unused.
   x_spec = get_padded_spec(arg_infos[0])
   out_sharding = NamedSharding(mesh, P(*x_spec[:-1]))
   return (out_sharding,) * 3
 
 # NOTE: `mesh` argument and output was added in the recent JAX commit 74bcd65
-def partition(epsilon, mesh, arg_infos, result_infos):
+def partition(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   x_spec = get_padded_spec(arg_infos[0])
   arg_shardings = (NamedSharding(mesh, P(*x_spec[:-1], None)),
                    ) + (NamedSharding(mesh, P()),) * 2
   out_shardings = (NamedSharding(mesh, P(*x_spec[:-1])),) * 3
-  return mesh, partial(layernorm_fwd_impl, epsilon=epsilon), out_shardings, arg_shardings
+  impl = partial(layernorm_fwd_impl, zero_centered_gamma=zero_centered_gamma,
+                 epsilon=epsilon)
+  return mesh, impl, out_shardings, arg_shardings
 
 _layernorm_fwd_lower.def_partition(
     infer_sharding_from_operands=infer_sharding_from_operands,
