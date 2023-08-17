@@ -6,7 +6,7 @@ from functools import partial
 import numpy as np
 import jax
 from jax import random
-from jax import core
+from jax import core, vmap
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from jax.experimental.custom_partitioning import custom_partitioning
@@ -108,7 +108,7 @@ def layernorm_fwd_batcher(
     x = jnp.moveaxis(x, -1, -2)
     x_bdim = x.ndim - 2
   out_bdims = x_bdim, batching.not_mapped, batching.not_mapped
-  return layernorm_fwd_p.bind(x, gamma, beta, epsilon=epsilon), out_bdims
+  return layernorm_fwd_p.bind(x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon), out_bdims
 batching.primitive_batchers[layernorm_fwd_p] = layernorm_fwd_batcher
 
 
@@ -173,6 +173,24 @@ def layernorm_bwd_impl(dz, x, mu, rsigma, gamma, zero_centered_gamma, epsilon):
       epsilon=epsilon)
   return dx.reshape(*pre, -1), dgamma, dbeta
 
+def layernorm_bwd_batcher(
+    batched_args: Sequence[jax.Array],
+    batch_dims: Sequence[int | None],
+    *,
+    zero_centered_gamma: bool,
+    epsilon: float,
+) -> tuple[Sequence[jax.Array], Sequence[int | None]]:
+  dz, x, mu, rsigma, gamma = batched_args
+  dz_bdim, x_bdim, mu_bdim, rsigma_bdim, gamma_bdim = batch_dims
+  if not (rsigma_bdim is gamma_bdim is batching.not_mapped):
+    raise NotImplementedError
+  if x_bdim == x.ndim - 1:
+    x = jnp.moveaxis(x, -1, -2)
+    x_bdim = x.ndim - 2
+  out_bdims = dz_bdim, x_bdim, batching.not_mapped
+  return layernorm_bwd_p.bind(dz, x, mu, rsigma, gamma, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon), out_bdims
+batching.primitive_batchers[layernorm_bwd_p] = layernorm_bwd_batcher
+
 _layernorm_bwd_lower = custom_partitioning(layernorm_bwd_impl, static_argnums=(5, 6))
 def infer_sharding_from_operands(
     zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
@@ -220,7 +238,6 @@ _layernorm_bwd_lower.def_partition(
 mlir.register_lowering(layernorm_bwd_p,
                        mlir.lower_fun(_layernorm_bwd_lower, multiple_results=True))
 
-
 # Tests
 
 # NOTE: wrapper which skips the layernorm_type argument; since it was unused
@@ -230,20 +247,25 @@ def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
   del layernorm_type
   return layernorm(x, gamma, beta, zero_centered_gamma, epsilon)
 
+def _func(x, gamma, beta):
+    return _layernorm(x, gamma, beta, None, False, 1e-6)
+
 def func(x, gamma, beta, y1, y2):
     if TEST_CASE == 0:
-        x = _layernorm(x, gamma, beta, None, False, 1e-6)
+        partial_ln = partial(_func, gamma=gamma, beta=beta)
+        x = vmap(partial_ln, in_axes=(0,))(x)
         x = jnp.dot(x, y1)
         out = jnp.dot(x, y2)
         return jnp.mean(out)
     else:
         x = jnp.dot(x, y1)
         x = jnp.dot(x, y2)
-        out = _layernorm(x, gamma, beta, None, False, 1e-6)
+        partial_ln = partial(_func, gamma=gamma, beta=beta)
+        out = vmap(partial_ln, in_axes=(0,))(x)
         return jnp.mean(out)
 
 
-x_ = random.normal(random.PRNGKey(1124), (32, 128))
+x_ = random.normal(random.PRNGKey(1124), (2, 32, 128))
 gamma_ = jnp.ones((128,))
 beta_ = jnp.ones((128,))
 y1_ = random.normal(random.PRNGKey(1126), (128, 128))
@@ -259,16 +281,16 @@ else:
     devices = devices.reshape((4, 2))
 
 with Mesh(devices, ('x', 'y')) as mesh:
-    x = jax.device_put(x_, NamedSharding(mesh, PartitionSpec('x', None)))
+    x = jax.device_put(x_, NamedSharding(mesh, PartitionSpec('y', 'x', None)))
     gamma = jax.device_put(gamma_, NamedSharding(mesh, PartitionSpec(None)))
     beta = jax.device_put(beta_, NamedSharding(mesh, PartitionSpec(None)))
     y1 = jax.device_put(y1_, NamedSharding(mesh, PartitionSpec(None, 'y')))
     y2 = jax.device_put(y2_, NamedSharding(mesh, PartitionSpec('y', None)))
 
     pjitter = pjit(graded_f,
-                   in_shardings=[PartitionSpec('x', None), PartitionSpec(None), PartitionSpec(None),
+                   in_shardings=[PartitionSpec('y', 'x', None), PartitionSpec(None), PartitionSpec(None),
                                       PartitionSpec(None, 'y'), PartitionSpec('y', None)],
-                   out_shardings=(None, (PartitionSpec('x', None), PartitionSpec(None), PartitionSpec(None),
+                   out_shardings=(None, (PartitionSpec('y', 'x', None), PartitionSpec(), PartitionSpec(),
                                               PartitionSpec(None, 'y'), PartitionSpec('y', None)))
               )
 
