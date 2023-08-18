@@ -279,6 +279,8 @@ ref_l, ref_grads = graded_f(x_, gamma_, beta_, y1_, y2_)
 devices = np.array(jax.local_devices())
 if len(devices) == 2:
     devices = devices.reshape((2, 1))
+elif len(devices) == 4:
+    devices = devices.reshape((2, 2))
 else:
     devices = devices.reshape((4, 2))
 
