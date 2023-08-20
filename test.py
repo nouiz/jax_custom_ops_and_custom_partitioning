@@ -29,6 +29,11 @@ assert TEST_CASE in (0, 1)
 
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4))
 def layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
+    partial_ln = partial(_layernorm, gamma=gamma, beta=beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+    out = vmap(partial_ln, in_axes=(0,))(x)
+    return out
+
+def _layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
   z, *_ = layernorm_fwd_p.bind(x, gamma, beta,
                                zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
   return z
@@ -173,6 +178,8 @@ def layernorm_bwd_impl(dz, x, mu, rsigma, gamma, zero_centered_gamma, epsilon):
       epsilon=epsilon)
   return dx.reshape(*pre, -1), dgamma, dbeta
 
+#Note that the batching rule for the bwd is not needed in this example,
+#since we are doing grad-of-vmap, i.e. vmap would be in the network definition
 def layernorm_bwd_batcher(
     batched_args: Sequence[jax.Array],
     batch_dims: Sequence[int | None],
@@ -247,21 +254,16 @@ def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
   del layernorm_type
   return layernorm(x, gamma, beta, zero_centered_gamma, epsilon)
 
-def _func(x, gamma, beta):
-    return _layernorm(x, gamma, beta, None, False, 1e-6)
-
 def func(x, gamma, beta, y1, y2):
     if TEST_CASE == 0:
-        partial_ln = partial(_func, gamma=gamma, beta=beta)
-        x = vmap(partial_ln, in_axes=(0,))(x)
+        x = _layernorm(x, gamma, beta, None, False, 1e-6)
         x = jnp.dot(x, y1)
         out = jnp.dot(x, y2)
         return jnp.mean(out)
     else:
         x = jnp.dot(x, y1)
         x = jnp.dot(x, y2)
-        partial_ln = partial(_func, gamma=gamma, beta=beta)
-        out = vmap(partial_ln, in_axes=(0,))(x)
+        out = _layernorm(x, gamma, beta, None, False, 1e-6)
         return jnp.mean(out)
 
 
@@ -292,7 +294,7 @@ with Mesh(devices, ('x', 'y')) as mesh:
     pjitter = pjit(graded_f,
                    in_shardings=[PartitionSpec('y', 'x', None), PartitionSpec(None), PartitionSpec(None),
                                       PartitionSpec(None, 'y'), PartitionSpec('y', None)],
-                   out_shardings=(None, (PartitionSpec('y', 'x', None), PartitionSpec(), PartitionSpec(),
+                   out_shardings=(None, (PartitionSpec('y', 'x', None), PartitionSpec(None), PartitionSpec(None),
                                               PartitionSpec(None, 'y'), PartitionSpec('y', None)))
               )
 
