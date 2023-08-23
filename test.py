@@ -1,5 +1,5 @@
 import os
-os.environ['XLA_FLAGS'] = "--xla_dump_hlo_as_proto --xla_dump_hlo_as_text --xla_dump_hlo_as_html --xla_dump_to=custom_part_ln_dump"
+os.environ['XLA_FLAGS'] = f"--xla_dump_hlo_as_proto --xla_dump_hlo_as_text --xla_dump_hlo_as_html --xla_dump_to=custom_part_ln_dump {os.environ['XLA_FLAGS']}"
 
 from collections.abc import Sequence
 from functools import partial
@@ -15,7 +15,10 @@ from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec, NamedSharding
 P = PartitionSpec
 
-from transformer_engine.jax import cpp_extensions
+try:
+  from transformer_engine.jax import cpp_extensions
+except:
+  cpp_extensions = None  # stubbing things out for local cpu development
 
 
 # 0: ln-dot-dot, 1: dot-dot-ln
@@ -29,7 +32,7 @@ assert TEST_CASE in (0, 1)
 # to set up the analogous layernorm_bwd_p primitive as its backward pass rule.
 
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def _layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
+def layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
   z, *_ = layernorm_fwd_p.bind(x, gamma, beta,
                                zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
   return z
@@ -87,9 +90,21 @@ def _layernorm_fwd_abstract_eval(x_aval, gamma_aval, beta_aval, *,
 def layernorm_fwd_impl(x, gamma, beta, zero_centered_gamma, epsilon):
   pre = x.shape[:-1]
   x = x.reshape(-1, x.shape[-1])
-  normed, mu, rsigma = cpp_extensions.layernorm_fwd(
-      x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-  return normed.reshape(*pre, -1), mu.reshape(pre), rsigma.reshape(pre)
+  if cpp_extensions:
+    z, mu, rsigma = cpp_extensions.layernorm_fwd(
+        x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+  else:
+    z, mu, rsigma = _layernorm_fwd_ref(x, gamma, beta, zero_centered_gamma, epsilon)
+  return z.reshape(*pre, -1), mu.reshape(pre), rsigma.reshape(pre)
+
+# This reference implementation is just for testing (e.g. on CPU).
+def _layernorm_fwd_ref(x, gamma, beta, zero_centered_gamma, epsilon):
+  if zero_centered_gamma: raise NotImplementedError
+  mu = x.mean(-1)
+  variance = jnp.mean(jnp.square(x), -1) - jnp.square(mu)
+  rsigma = jax.lax.rsqrt(variance + epsilon)
+  z = (x - mu[..., None]) * rsigma[..., None] * gamma + beta
+  return z, mu, rsigma
 
 
 # The vmap (batching) rule for layernorm_fwd_p just needs to ensure the batch
@@ -129,8 +144,12 @@ batching.primitive_batchers[layernorm_fwd_p] = layernorm_fwd_batcher
 from jax._src.interpreters import mlir
 from jax.experimental.custom_partitioning import custom_partitioning
 
-_layernorm_fwd_lower = custom_partitioning(layernorm_fwd_impl,
-                                           static_argnums=(3, 4))
+if cpp_extensions:
+  _layernorm_fwd_lower = custom_partitioning(layernorm_fwd_impl,
+                                             static_argnums=(3, 4))
+else:
+  _layernorm_fwd_lower = layernorm_fwd_impl
+  _layernorm_fwd_lower.def_partition = lambda *_, **__: None
 
 # NOTE: `mesh` argument was added in the recent JAX commit 74bcd65
 def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
@@ -178,10 +197,24 @@ def layernorm_bwd_impl(dz, x, mu, rsigma, gamma, zero_centered_gamma, epsilon):
   x = x.reshape(-1, x.shape[-1])
   mu = mu.reshape(-1)
   rsigma = rsigma.reshape(-1)
-  dx, dgamma, dbeta = cpp_extensions.layernorm_bwd(
-      dz, mu, rsigma, x, gamma, zero_centered_gamma=zero_centered_gamma,
-      epsilon=epsilon)
+  if cpp_extensions:
+    dx, dgamma, dbeta = cpp_extensions.layernorm_bwd(
+        dz, mu, rsigma, x, gamma, zero_centered_gamma=zero_centered_gamma,
+        epsilon=epsilon)
+  else:
+    dx, dgamma, dbeta = _layernorm_bwd_ref(
+        dz, mu, rsigma, x, gamma, zero_centered_gamma, epsilon)
   return dx.reshape(*pre, -1), dgamma, dbeta
+
+# This reference implementation is just for testing (e.g. on CPU).
+def _layernorm_bwd_ref(dz, mu, rsigma, x, gamma, zero_centered_gamma, epsilon):
+  del mu, rsigma
+  dbeta = dz.sum(range(dz.ndim - 1))
+  _, vjp = jax.vjp(lambda x, gamma, beta:
+                   _layernorm_fwd_ref(x, gamma, beta, zero_centered_gamma, epsilon)[0],
+                   x, gamma, jnp.zeros_like(gamma))
+  dx, dgamma, dbeta = vjp(dz)
+  return dx, dgamma, dbeta
 
 def layernorm_bwd_batcher(
     batched_args: Sequence[jax.Array],
@@ -205,7 +238,11 @@ def layernorm_bwd_batcher(
   return (dx, dgamma, dbeta), (x_bdim, not_mapped, not_mapped)
 batching.primitive_batchers[layernorm_bwd_p] = layernorm_bwd_batcher
 
-_layernorm_bwd_lower = custom_partitioning(layernorm_bwd_impl, static_argnums=(5, 6))
+if cpp_extensions:
+  _layernorm_bwd_lower = custom_partitioning(layernorm_bwd_impl, static_argnums=(5, 6))
+else:
+  _layernorm_bwd_lower = layernorm_bwd_impl
+  _layernorm_bwd_lower.def_partition = lambda *_, **__: None
 def infer_sharding_from_operands(
     zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   x_spec = get_padded_spec(arg_infos[0])
