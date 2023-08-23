@@ -1,6 +1,7 @@
 import os
 os.environ['XLA_FLAGS'] = "--xla_dump_hlo_as_proto --xla_dump_hlo_as_text --xla_dump_hlo_as_html --xla_dump_to=custom_part_ln_dump"
 
+from collections.abc import Sequence
 from functools import partial
 
 import numpy as np
@@ -15,7 +16,7 @@ from jax.sharding import PartitionSpec, NamedSharding
 P = PartitionSpec
 
 from transformer_engine.jax import cpp_extensions
-from collections.abc import Sequence
+
 
 # 0: ln-dot-dot, 1: dot-dot-ln
 TEST_CASE = int(os.environ.get("TEST_CASE", 0))
@@ -28,11 +29,6 @@ assert TEST_CASE in (0, 1)
 # to set up the analogous layernorm_bwd_p primitive as its backward pass rule.
 
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
-    partial_ln = partial(_layernorm, gamma=gamma, beta=beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-    out = vmap(partial_ln, in_axes=(0,))(x)
-    return out
-
 def _layernorm(x, gamma, beta, zero_centered_gamma, epsilon):
   z, *_ = layernorm_fwd_p.bind(x, gamma, beta,
                                zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
@@ -74,6 +70,9 @@ def _layernorm_fwd_abstract_eval(x_aval, gamma_aval, beta_aval, *,
   del gamma_aval, beta_aval, epsilon
   out_aval = core.raise_to_shaped(x_aval)
   mu_aval = rsigma_aval = out_aval.update(shape=out_aval.shape[:-1])
+  # out_aval:    [N1, N2, ..., Nk, H]
+  # mu_aval:     [N1, N2, ..., Nk]
+  # rsigma_aval: [N1, N2, ..., Nk]
   return out_aval, mu_aval, rsigma_aval
 
 # While the layernorm_fwd_p in this file supports multiple batch dimensions, the
@@ -93,10 +92,12 @@ def layernorm_fwd_impl(x, gamma, beta, zero_centered_gamma, epsilon):
   return normed.reshape(*pre, -1), mu.reshape(pre), rsigma.reshape(pre)
 
 
-# The vmap (batching) rule for layernorm_fwd_p just needs to put batch
-# dimensions at the front.
+# The vmap (batching) rule for layernorm_fwd_p just needs to ensure the batch
+# dimension is not in the last position (since the primitive requires batch
+# dimensions at the front).
 
 from jax._src.interpreters import batching
+from jax._src.interpreters.batching import not_mapped
 
 def layernorm_fwd_batcher(
     batched_args: Sequence[jax.Array],
@@ -107,13 +108,17 @@ def layernorm_fwd_batcher(
 ) -> tuple[Sequence[jax.Array], Sequence[int | None]]:
   x, gamma, beta = batched_args
   x_bdim, gamma_bdim, beta_bdim = batch_dims
-  if not (gamma_bdim is beta_bdim is batching.not_mapped):
-    raise NotImplementedError
+  if not (gamma_bdim is beta_bdim is not_mapped):
+    raise NotImplementedError  # kernel doesn't support gamma or beta batching
   if x_bdim == x.ndim - 1:
     x = jnp.moveaxis(x, -1, -2)
     x_bdim = x.ndim - 2
-  out_bdims = x_bdim, batching.not_mapped, batching.not_mapped
-  return layernorm_fwd_p.bind(x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon), out_bdims
+  z, mu, rsigma = layernorm_fwd_p.bind(
+      x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+  # Recall x and z are of shape [N1, N2, ..., Nk, H], and mu and rsigma are
+  # of shape [N1, N2, ..., Nk]; in particular, they all have the vmapped axis in
+  # the same position.
+  return (z, mu, rsigma), (x_bdim, x_bdim, x_bdim)
 batching.primitive_batchers[layernorm_fwd_p] = layernorm_fwd_batcher
 
 
@@ -178,8 +183,6 @@ def layernorm_bwd_impl(dz, x, mu, rsigma, gamma, zero_centered_gamma, epsilon):
       epsilon=epsilon)
   return dx.reshape(*pre, -1), dgamma, dbeta
 
-#Note that the batching rule for the bwd is not needed in this example,
-#since we are doing grad-of-vmap, i.e. vmap would be in the network definition
 def layernorm_bwd_batcher(
     batched_args: Sequence[jax.Array],
     batch_dims: Sequence[int | None],
@@ -189,13 +192,17 @@ def layernorm_bwd_batcher(
 ) -> tuple[Sequence[jax.Array], Sequence[int | None]]:
   dz, x, mu, rsigma, gamma = batched_args
   dz_bdim, x_bdim, mu_bdim, rsigma_bdim, gamma_bdim = batch_dims
-  if not (rsigma_bdim is gamma_bdim is batching.not_mapped):
-    raise NotImplementedError
-  if x_bdim == x.ndim - 1:
-    x = jnp.moveaxis(x, -1, -2)
-    x_bdim = x.ndim - 2
-  out_bdims = dz_bdim, x_bdim, batching.not_mapped
-  return layernorm_bwd_p.bind(dz, x, mu, rsigma, gamma, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon), out_bdims
+  if gamma_bdim is not not_mapped:
+    raise NotImplementedError  # kernel doesn't support gamma batching
+  if x_bdim != mu_bdim or x_bdim != rsigma_bdim:
+    raise NotImplementedError  # TODO: just jnp.moveaxis/broadcast them to match
+  if dz_bdim != x_bdim:
+    dz = jnp.moveaxis(dz, dz_bdim, x_bdim)
+    dz_bdim = x_bdim
+  dx, dgamma, dbeta = layernorm_bwd_p.bind(
+      dz, x, mu, rsigma, gamma, zero_centered_gamma=zero_centered_gamma,
+      epsilon=epsilon)
+  return (dx, dgamma, dbeta), (x_bdim, not_mapped, not_mapped)
 batching.primitive_batchers[layernorm_bwd_p] = layernorm_bwd_batcher
 
 _layernorm_bwd_lower = custom_partitioning(layernorm_bwd_impl, static_argnums=(5, 6))
@@ -255,15 +262,17 @@ def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
   return layernorm(x, gamma, beta, zero_centered_gamma, epsilon)
 
 def func(x, gamma, beta, y1, y2):
+    layernorm = partial(_layernorm, gamma=gamma, beta=beta, layernorm_type=None,
+                        zero_centered_gamma=False, epsilon=1e-6)
     if TEST_CASE == 0:
-        x = _layernorm(x, gamma, beta, None, False, 1e-6)
+        x = vmap(layernorm)(x)
         x = jnp.dot(x, y1)
         out = jnp.dot(x, y2)
         return jnp.mean(out)
     else:
         x = jnp.dot(x, y1)
         x = jnp.dot(x, y2)
-        out = _layernorm(x, gamma, beta, None, False, 1e-6)
+        out = vmap(layernorm)(x)
         return jnp.mean(out)
 
 
@@ -294,7 +303,7 @@ with Mesh(devices, ('x', 'y')) as mesh:
     pjitter = pjit(graded_f,
                    in_shardings=[PartitionSpec('y', 'x', None), PartitionSpec(None), PartitionSpec(None),
                                       PartitionSpec(None, 'y'), PartitionSpec('y', None)],
-                   out_shardings=(None, (PartitionSpec('y', 'x', None), PartitionSpec(None), PartitionSpec(None),
+                   out_shardings=(None, (PartitionSpec('y', 'x', None), PartitionSpec(), PartitionSpec(),
                                               PartitionSpec(None, 'y'), PartitionSpec('y', None)))
               )
 
