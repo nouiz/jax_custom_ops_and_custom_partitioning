@@ -124,8 +124,9 @@ _layernorm_fwd_lower = custom_partitioning(layernorm_fwd_impl,
 def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   del epsilon, result_infos  # Unused.
   x_spec = get_padded_spec(arg_infos[0])
-  # FIXME (Ming Huang): Why out_sharding is P(*x_spec[:-1]), instead of P(*x_spec)
-  # I imagine the returns would be like (P(*x_spec), P(*x_spec[:-1]), P(*x_spec[:-1]))
+  # Shortcut: the first sharding end up (x_spec[0], None) and the 2
+  # others (x_spec[0]). If the rank of the spec is lower than the rank
+  # of the tensor, the spec right padded with None.
   out_sharding = NamedSharding(mesh, P(*x_spec[:-1]))
   return (out_sharding,) * 3
 

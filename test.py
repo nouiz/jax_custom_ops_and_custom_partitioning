@@ -132,6 +132,9 @@ def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, 
   del epsilon, result_infos  # Unused.
   x_spec = get_padded_spec(arg_infos[0])
   out_sharding = NamedSharding(mesh, P(*x_spec[:-1]))
+  # Shortcut: the first sharding end up (x_spec[0], None) and the 2
+  # others (x_spec[0]). If the rank of the spec is lower than the rank
+  # of the tensor, the spec right padded with None.
   return (out_sharding,) * 3
 
 # NOTE: `mesh` argument and output was added in the recent JAX commit 74bcd65
