@@ -17,7 +17,7 @@ P = PartitionSpec
 
 try:
   from transformer_engine.jax import cpp_extensions
-except:
+except Exception:
   cpp_extensions = None  # stubbing things out for local cpu development
 
 
