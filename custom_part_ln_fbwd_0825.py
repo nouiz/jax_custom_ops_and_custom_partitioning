@@ -274,7 +274,8 @@ _layernorm_fwd_lower.def_partition(
     partition=partition)
 
 mlir.register_lowering(layernorm_fwd_p,
-                       mlir.lower_fun(_layernorm_fwd_lower, multiple_results=True))
+                       mlir.lower_fun(_layernorm_fwd_lower, multiple_results=True),
+                       platform='cuda')
 
 
 
@@ -359,7 +360,8 @@ _layernorm_bwd_lower.def_partition(
 
 
 mlir.register_lowering(layernorm_bwd_p,
-                       mlir.lower_fun(_layernorm_bwd_lower, multiple_results=True))
+                       mlir.lower_fun(_layernorm_bwd_lower, multiple_results=True),
+                       platform='cuda')
 
 # Tests
 def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
