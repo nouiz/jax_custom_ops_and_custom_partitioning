@@ -256,7 +256,8 @@ def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, 
   del zero_centered_gamma, epsilon, result_infos  # Unused.
   x_spec = get_padded_spec(arg_infos[0])
   out_sharding = NamedSharding(mesh, P(*x_spec[:-1]))
-  return (out_sharding,) * 3
+  # The output must be a list
+  return [out_sharding,] * 3
 
 def partition(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   x_spec = NamedSharding(mesh, P(*get_padded_spec(arg_infos[0])))
@@ -264,7 +265,8 @@ def partition(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   b_spec = NamedSharding(mesh, P(*get_padded_spec(arg_infos[2])))
   out_spec = NamedSharding(mesh, P(*get_padded_spec(arg_infos[0])[:-1]))
   arg_shardings = (x_spec, g_spec, b_spec)
-  out_shardings = (out_spec,) * 3
+  # out_shardings must be a list
+  out_shardings = [out_spec,] * 3
   impl = partial(te_layernorm_fwd, zero_centered_gamma=zero_centered_gamma,
                  epsilon=epsilon)
   return mesh, impl, out_shardings, arg_shardings
