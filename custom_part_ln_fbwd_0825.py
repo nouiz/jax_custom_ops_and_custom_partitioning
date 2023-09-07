@@ -414,7 +414,12 @@ graded_f = jax.value_and_grad(vmap_f, argnums=(0, 1, 2, 3, 4))
 graded_f_ref = jax.value_and_grad(vmap_f_ref, argnums=(0, 1, 2, 3, 4))
 
 devices = np.array(jax.local_devices())
-devices = devices.reshape((2, 2, 2))
+if len(devices) == 2:
+    devices = devices.reshape((1, 2, 1))
+elif len(devices) == 4:
+    devices = devices.reshape((2, 2, 1))
+else:
+    devices = devices.reshape((2, 2, 2))
 with Mesh(devices, ('p', 'd', 't')) as mesh:
     x = jax.device_put(x_, NamedSharding(mesh, PartitionSpec('p', 'd', None)))
     gamma = jax.device_put(gamma_, NamedSharding(mesh, PartitionSpec('p', None)))
