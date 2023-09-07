@@ -18,8 +18,8 @@ P = PartitionSpec
 from collections.abc import Sequence
 
 P_MESH_SIZE = 2
-D_MESH_SIZE = 2
-T_MESH_SIZE = 2
+D_MESH_SIZE = 2  # Not used
+T_MESH_SIZE = 2  # Not used
 
 # ------------------------------------------------------------------------
 from transformer_engine.jax.cpp_extensions import _layernorm_fwd_p, _layernorm_bwd_p
@@ -207,22 +207,22 @@ def layernorm_bwd_rule(zero_centered_gamma, epsilon, res, dz):
 layernorm.defvjp(layernorm_fwd_rule, layernorm_bwd_rule)
 
 
-layernorm_fwd_p = core.Primitive('layernorm_fwd')
-layernorm_fwd_p.multiple_results = True
+layernorm_fwd_p = _layernorm_fwd_p #layernorm_fwd_p = core.Primitive('layernorm_fwd')
+#layernorm_fwd_p.multiple_results = True
 
-@layernorm_fwd_p.def_abstract_eval
-def _layernorm_fwd_abstract_eval(x_aval, gamma_aval, beta_aval, *,
-                                 zero_centered_gamma, epsilon):
-  del gamma_aval, beta_aval, epsilon
-  out_aval = core.raise_to_shaped(x_aval)
-  mu_aval = rsigma_aval = out_aval.update(shape=out_aval.shape[:-1])
-  return out_aval, mu_aval, rsigma_aval
+#@layernorm_fwd_p.def_abstract_eval
+#def _layernorm_fwd_abstract_eval(x_aval, gamma_aval, beta_aval, *,
+#                                 zero_centered_gamma, epsilon):
+#  del gamma_aval, beta_aval, epsilon
+#  out_aval = core.raise_to_shaped(x_aval)
+#  mu_aval = rsigma_aval = out_aval.update(shape=out_aval.shape[:-1])
+#  return out_aval, mu_aval, rsigma_aval
 
-@layernorm_fwd_p.def_impl
-def layernorm_fwd_impl(x, gamma, beta, zero_centered_gamma, epsilon):
-   normed, mu, rsigma = te_layernorm_fwd(
-      x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
-   return normed, mu, rsigma
+#@layernorm_fwd_p.def_impl
+#def layernorm_fwd_impl(x, gamma, beta, zero_centered_gamma, epsilon):
+#   normed, mu, rsigma = te_layernorm_fwd(
+#      x, gamma, beta, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon)
+#   return normed, mu, rsigma
 
 from jax._src.interpreters import batching
 
@@ -249,14 +249,15 @@ batching.primitive_batchers[layernorm_fwd_p] = layernorm_fwd_batcher
 from jax._src.interpreters import mlir
 from jax.experimental.custom_partitioning import custom_partitioning
 
-_layernorm_fwd_lower = custom_partitioning(layernorm_fwd_impl,
+_layernorm_fwd_lower = custom_partitioning(te_layernorm_fwd,
                                            static_argnums=(3, 4))
 
 def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   del zero_centered_gamma, epsilon, result_infos  # Unused.
   x_spec = get_padded_spec(arg_infos[0])
   out_sharding = NamedSharding(mesh, P(*x_spec[:-1]))
-  return (out_sharding,) * 3
+  # The output must be a list
+  return [out_sharding,] * 3
 
 def partition(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   x_spec = NamedSharding(mesh, P(*get_padded_spec(arg_infos[0])))
@@ -264,8 +265,9 @@ def partition(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   b_spec = NamedSharding(mesh, P(*get_padded_spec(arg_infos[2])))
   out_spec = NamedSharding(mesh, P(*get_padded_spec(arg_infos[0])[:-1]))
   arg_shardings = (x_spec, g_spec, b_spec)
-  out_shardings = (out_spec,) * 3
-  impl = partial(layernorm_fwd_impl, zero_centered_gamma=zero_centered_gamma,
+  # out_shardings must be a list
+  out_shardings = [out_spec,] * 3
+  impl = partial(te_layernorm_fwd, zero_centered_gamma=zero_centered_gamma,
                  epsilon=epsilon)
   return mesh, impl, out_shardings, arg_shardings
 
@@ -274,7 +276,8 @@ _layernorm_fwd_lower.def_partition(
     partition=partition)
 
 mlir.register_lowering(layernorm_fwd_p,
-                       mlir.lower_fun(_layernorm_fwd_lower, multiple_results=True))
+                       mlir.lower_fun(_layernorm_fwd_lower, multiple_results=True),
+                       platform='cuda')
 
 
 
@@ -359,7 +362,8 @@ _layernorm_bwd_lower.def_partition(
 
 
 mlir.register_lowering(layernorm_bwd_p,
-                       mlir.lower_fun(_layernorm_bwd_lower, multiple_results=True))
+                       mlir.lower_fun(_layernorm_bwd_lower, multiple_results=True),
+                       platform='cuda')
 
 # Tests
 def _layernorm(x, gamma, beta, layernorm_type, zero_centered_gamma, epsilon):
@@ -410,7 +414,12 @@ graded_f = jax.value_and_grad(vmap_f, argnums=(0, 1, 2, 3, 4))
 graded_f_ref = jax.value_and_grad(vmap_f_ref, argnums=(0, 1, 2, 3, 4))
 
 devices = np.array(jax.local_devices())
-devices = devices.reshape((2, 2, 2))
+if len(devices) == 2:
+    devices = devices.reshape((1, 2, 1))
+elif len(devices) == 4:
+    devices = devices.reshape((2, 2, 1))
+else:
+    devices = devices.reshape((2, 2, 2))
 with Mesh(devices, ('p', 'd', 't')) as mesh:
     x = jax.device_put(x_, NamedSharding(mesh, PartitionSpec('p', 'd', None)))
     gamma = jax.device_put(gamma_, NamedSharding(mesh, PartitionSpec('p', None)))

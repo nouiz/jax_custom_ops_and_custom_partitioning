@@ -152,6 +152,9 @@ else:
   _layernorm_fwd_lower.def_partition = lambda *_, **__: None
 
 # NOTE: `mesh` argument was added in the recent JAX commit 74bcd65
+# This function is only a hint to the compiler. The input sharding can
+# be different in the partition call.  The value in partition call is
+# the real value.
 def infer_sharding_from_operands(zero_centered_gamma, epsilon, mesh, arg_infos, result_infos):
   del epsilon, result_infos  # Unused.
   x_spec = get_padded_spec(arg_infos[0])
